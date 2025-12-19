@@ -2,3 +2,5 @@ streamlit
 opencv-python
 numpy
 pandas
+opencv-python-headless
+streamlit
