@@ -1,0 +1,349 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { Upload, Layers, Activity, CheckCircle, AlertCircle, Settings } from 'lucide-react';
+
+const LaneDetectionApp = () => {
+  const [imageSrc, setImageSrc] = useState(null);
+  const [processedImageSrc, setProcessedImageSrc] = useState(null);
+  const [cvLoaded, setCvLoaded] = useState(false);
+  const [currentStep, setCurrentStep] = useState(0);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [selectedAlgo, setSelectedAlgo] = useState('Canny'); // Default algorithm
+  
+  // Ref for the canvas to perform OpenCV operations
+  const canvasRef = useRef(null);
+
+  // Load OpenCV.js
+  useEffect(() => {
+    const script = document.createElement('script');
+    script.src = 'https://docs.opencv.org/4.8.0/opencv.js';
+    script.async = true;
+    script.onload = () => {
+      setCvLoaded(true);
+      console.log('OpenCV.js loaded');
+    };
+    document.body.appendChild(script);
+    return () => {
+      document.body.removeChild(script);
+    };
+  }, []);
+
+  const handleImageUpload = (e) => {
+    const file = e.target.files[0];
+    if (file) {
+      const reader = new FileReader();
+      reader.onload = (event) => {
+        setImageSrc(event.target.result);
+        setProcessedImageSrc(null);
+        setCurrentStep(0); // Reset to start
+      };
+      reader.readAsDataURL(file);
+    }
+  };
+
+  // Helper function to apply custom kernels (Prewitt, Roberts)
+  const applyKernelEdgeDetection = (cv, src, kernelXData, kernelYData) => {
+    let dst = new cv.Mat();
+    let srcFloat = new cv.Mat();
+    src.convertTo(srcFloat, cv.CV_32F); // Convert to float for precision
+
+    // Create Kernels
+    let kernelX = cv.matFromArray(kernelXData.rows, kernelXData.cols, cv.CV_32F, kernelXData.data);
+    let kernelY = cv.matFromArray(kernelYData.rows, kernelYData.cols, cv.CV_32F, kernelYData.data);
+
+    let gradX = new cv.Mat();
+    let gradY = new cv.Mat();
+    
+    // Convolve
+    cv.filter2D(srcFloat, gradX, -1, kernelX);
+    cv.filter2D(srcFloat, gradY, -1, kernelY);
+    
+    // Calculate Magnitude
+    let magnitude = new cv.Mat();
+    cv.magnitude(gradX, gradY, magnitude);
+    
+    // Normalize and convert back to 8-bit
+    cv.normalize(magnitude, magnitude, 0, 255, cv.NORM_MINMAX);
+    magnitude.convertTo(dst, cv.CV_8U);
+
+    // Cleanup
+    srcFloat.delete(); kernelX.delete(); kernelY.delete(); gradX.delete(); gradY.delete(); magnitude.delete();
+    return dst;
+  };
+
+  const processStep = (step) => {
+    if (!cvLoaded || !imageSrc) return;
+    setIsProcessing(true);
+    setCurrentStep(step);
+
+    setTimeout(() => {
+      try {
+        const cv = window.cv;
+        const imgElement = document.getElementById('uploaded-image');
+        let src = cv.imread(imgElement);
+        let dst = new cv.Mat();
+        
+        // --- STEP 1: PREPROCESSING ---
+        cv.cvtColor(src, src, cv.COLOR_RGBA2GRAY, 0);
+        let ksize = new cv.Size(5, 5);
+        cv.GaussianBlur(src, src, ksize, 0, 0, cv.BORDER_DEFAULT);
+
+        if (step === 1) {
+          cv.imshow(canvasRef.current, src);
+          src.delete(); dst.delete();
+          setIsProcessing(false);
+          return;
+        }
+
+        // --- STEP 2: EDGE DETECTION (DYNAMIC ALGORITHMS) ---
+        if (selectedAlgo === 'Canny') {
+            // Canny is special (hysteresis built-in)
+            cv.Canny(src, dst, 50, 150, 3, false);
+        } 
+        else if (selectedAlgo === 'Sobel') {
+            // Sobel derivatives
+            let gradX = new cv.Mat();
+            let gradY = new cv.Mat();
+            let absGradX = new cv.Mat();
+            let absGradY = new cv.Mat();
+            
+            cv.Sobel(src, gradX, cv.CV_16S, 1, 0, 3, 1, 0, cv.BORDER_DEFAULT);
+            cv.Sobel(src, gradY, cv.CV_16S, 0, 1, 3, 1, 0, cv.BORDER_DEFAULT);
+            
+            cv.convertScaleAbs(gradX, absGradX);
+            cv.convertScaleAbs(gradY, absGradY);
+            cv.addWeighted(absGradX, 0.5, absGradY, 0.5, 0, dst);
+            
+            gradX.delete(); gradY.delete(); absGradX.delete(); absGradY.delete();
+        }
+        else if (selectedAlgo === 'Laplacian') {
+            // Laplacian uses 2nd derivative
+            let lap = new cv.Mat();
+            cv.Laplacian(src, lap, cv.CV_16S, 3, 1, 0, cv.BORDER_DEFAULT);
+            cv.convertScaleAbs(lap, dst);
+            lap.delete();
+        }
+        else if (selectedAlgo === 'Prewitt') {
+            // Prewitt Kernels
+            const kx = { rows: 3, cols: 3, data: [-1, 0, 1, -1, 0, 1, -1, 0, 1] };
+            const ky = { rows: 3, cols: 3, data: [-1, -1, -1, 0, 0, 0, 1, 1, 1] };
+            dst = applyKernelEdgeDetection(cv, src, kx, ky);
+        }
+        else if (selectedAlgo === 'Roberts') {
+            // Roberts Cross Kernels (2x2)
+            const kx = { rows: 2, cols: 2, data: [1, 0, 0, -1] };
+            const ky = { rows: 2, cols: 2, data: [0, 1, -1, 0] };
+            dst = applyKernelEdgeDetection(cv, src, kx, ky);
+        }
+
+        // --- Apply Thresholding for Non-Canny methods to get clean binary edges for Hough ---
+        // Canny output is already binary (0 or 255). Others are gradients.
+        if (selectedAlgo !== 'Canny') {
+            cv.threshold(dst, dst, 100, 255, cv.THRESH_BINARY);
+        }
+
+        if (step === 2) {
+            cv.imshow(canvasRef.current, dst);
+            src.delete(); dst.delete();
+            setIsProcessing(false);
+            return;
+        }
+
+        // --- STEP 3: ATTENTION REGION (ROI) ---
+        let mask = new cv.Mat.zeros(src.rows, src.cols, cv.CV_8UC1);
+        let polyPts = new cv.MatVector();
+        let pts = cv.matFromArray(4, 1, cv.CV_32SC2, [
+            src.cols * 0.1, src.rows,         
+            src.cols * 0.45, src.rows * 0.6,  
+            src.cols * 0.55, src.rows * 0.6,  
+            src.cols * 0.9, src.rows          
+        ]);
+        polyPts.push_back(pts);
+        cv.fillPoly(mask, polyPts, [255, 255, 255, 255]);
+        
+        let maskedEdges = new cv.Mat();
+        cv.bitwise_and(dst, dst, maskedEdges, mask);
+
+        if (step === 3) {
+            cv.imshow(canvasRef.current, maskedEdges);
+            src.delete(); dst.delete(); mask.delete(); polyPts.delete(); pts.delete(); maskedEdges.delete();
+            setIsProcessing(false);
+            return;
+        }
+
+        // --- STEP 4: HOUGH TRANSFORM ---
+        let lines = new cv.Mat();
+        let colorDst = cv.imread(imgElement); 
+        
+        // Hough settings might need tweaking for different algorithms as edge thickness varies
+        let threshold = selectedAlgo === 'Canny' ? 50 : 80; 
+        cv.HoughLinesP(maskedEdges, lines, 1, Math.PI / 180, threshold, 50, 10);
+
+        for (let i = 0; i < lines.rows; ++i) {
+            let startPoint = new cv.Point(lines.data32S[i * 4], lines.data32S[i * 4 + 1]);
+            let endPoint = new cv.Point(lines.data32S[i * 4 + 2], lines.data32S[i * 4 + 3]);
+            cv.line(colorDst, startPoint, endPoint, [255, 255, 0, 255], 5);
+        }
+
+        cv.imshow(canvasRef.current, colorDst);
+
+        src.delete(); dst.delete(); mask.delete(); polyPts.delete(); pts.delete(); maskedEdges.delete(); lines.delete(); colorDst.delete();
+        setIsProcessing(false);
+
+      } catch (err) {
+        console.error(err);
+        setIsProcessing(false);
+      }
+    }, 100);
+  };
+
+  const steps = [
+    { title: "Original Image", desc: "Raw input from camera/file." },
+    { title: "1. Preprocessing", desc: "Grayscale conversion & Gaussian Blur." },
+    { title: "2. Edge Detection", desc: `Using ${selectedAlgo} Algorithm.` },
+    { title: "3. Attention Region (ROI)", desc: "Masking top half to focus on road." },
+    { title: "4. Hough Transform (Final)", desc: "Identifying straight lines." },
+  ];
+
+  return (
+    <div className="min-h-screen bg-slate-900 text-white p-6 font-sans">
+      <div className="max-w-5xl mx-auto">
+        
+        <header className="mb-8 border-b border-slate-700 pb-4">
+          <h1 className="text-3xl font-bold text-yellow-400 mb-2 flex items-center gap-3">
+            <Activity className="w-8 h-8" />
+            Lane Detection System (Algorithm Lab)
+          </h1>
+          <p className="text-slate-400">
+            Compare algorithms from the paper: Canny vs Sobel vs Prewitt vs Roberts vs Laplacian.
+          </p>
+          {!cvLoaded && (
+            <div className="mt-2 text-blue-400 flex items-center gap-2 text-sm animate-pulse">
+              <AlertCircle className="w-4 h-4" /> Loading OpenCV Library... Please wait.
+            </div>
+          )}
+        </header>
+
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+          
+          <div className="bg-slate-800 p-6 rounded-xl border border-slate-700 shadow-lg h-fit">
+            <h2 className="text-xl font-semibold mb-4 flex items-center gap-2">
+              <Settings className="w-5 h-5 text-blue-400" />
+              Configuration
+            </h2>
+
+            {/* Algorithm Selector */}
+            <div className="mb-6">
+                <label className="block text-sm text-slate-400 mb-2">Select Edge Detection Algorithm:</label>
+                <select 
+                    className="w-full bg-slate-900 border border-slate-600 rounded p-2 text-white focus:ring-2 focus:ring-blue-500 outline-none"
+                    value={selectedAlgo}
+                    onChange={(e) => {
+                        setSelectedAlgo(e.target.value);
+                        if(currentStep > 1) setCurrentStep(0); // Reset if changing mid-process
+                    }}
+                >
+                    <option value="Canny">Canny (Recommended)</option>
+                    <option value="Sobel">Sobel Operator</option>
+                    <option value="Prewitt">Prewitt Operator</option>
+                    <option value="Roberts">Roberts Cross</option>
+                    <option value="Laplacian">Laplacian</option>
+                </select>
+                <p className="text-xs text-slate-500 mt-2">
+                    {selectedAlgo === 'Canny' && "Best for clean lines. Low error rate (FOM 0.212)."}
+                    {selectedAlgo === 'Sobel' && "Fastest computation (0.045s). Good for vertical edges."}
+                    {selectedAlgo === 'Prewitt' && "Highest accuracy score (FOM 0.385) in paper tests."}
+                    {selectedAlgo === 'Roberts' && "Sensitive to diagonal edges. Susceptible to noise."}
+                    {selectedAlgo === 'Laplacian' && "Detects all edges equally. High computation time."}
+                </p>
+            </div>
+
+            <div className="mb-6">
+              <label className="block w-full cursor-pointer bg-slate-700 hover:bg-slate-600 border-2 border-dashed border-slate-500 rounded-lg p-4 text-center transition-all">
+                <Upload className="w-8 h-8 mx-auto mb-2 text-slate-400" />
+                <span className="text-sm text-slate-300">Upload Road Image</span>
+                <input type="file" accept="image/*" onChange={handleImageUpload} className="hidden" />
+              </label>
+            </div>
+
+            <div className="space-y-3">
+              {steps.map((s, index) => (
+                <button
+                  key={index}
+                  disabled={!imageSrc || !cvLoaded}
+                  onClick={() => index === 0 ? setCurrentStep(0) : processStep(index)}
+                  className={`w-full text-left p-3 rounded-lg flex items-center gap-3 transition-all ${
+                    currentStep === index 
+                      ? 'bg-blue-600 text-white border border-blue-400' 
+                      : 'bg-slate-700 text-slate-300 hover:bg-slate-600'
+                  } ${(!imageSrc || !cvLoaded) ? 'opacity-50 cursor-not-allowed' : ''}`}
+                >
+                  <div className={`w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold ${currentStep === index ? 'bg-white text-blue-600' : 'bg-slate-800'}`}>
+                    {index}
+                  </div>
+                  <div>
+                    <div className="font-medium text-sm">{s.title}</div>
+                  </div>
+                  {currentStep === index && <CheckCircle className="w-4 h-4 ml-auto" />}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="lg:col-span-2 space-y-6">
+            <div className="bg-slate-800 p-4 rounded-xl border border-slate-700 shadow-lg min-h-[400px] flex flex-col items-center justify-center relative overflow-hidden">
+              {!imageSrc ? (
+                <div className="text-center text-slate-500">
+                   <p className="mb-2">No image selected</p>
+                   <p className="text-sm">Upload an image to start experimentation</p>
+                </div>
+              ) : (
+                <>
+                  <img 
+                    id="uploaded-image" 
+                    src={imageSrc} 
+                    alt="Original" 
+                    className="hidden" 
+                    onLoad={() => setCurrentStep(0)}
+                  />
+                  <div className={`relative ${currentStep === 0 ? 'hidden' : 'block'}`}>
+                     <canvas ref={canvasRef} className="max-w-full h-auto rounded shadow-xl border border-slate-600"></canvas>
+                     <div className="absolute top-2 left-2 bg-black/70 px-3 py-1 rounded text-xs font-mono text-yellow-300">
+                        {steps[currentStep]?.title}
+                     </div>
+                  </div>
+                  {currentStep === 0 && (
+                    <div className="relative">
+                        <img src={imageSrc} alt="Original" className="max-w-full h-auto rounded shadow-xl border border-slate-600" />
+                        <div className="absolute top-2 left-2 bg-black/70 px-3 py-1 rounded text-xs font-mono text-white">Original Input</div>
+                    </div>
+                  )}
+                  {isProcessing && (
+                    <div className="absolute inset-0 bg-slate-900/80 flex flex-col items-center justify-center z-10">
+                        <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-yellow-400 mb-4"></div>
+                        <p className="text-yellow-400 font-mono animate-pulse">Running {selectedAlgo}...</p>
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+            
+            {imageSrc && currentStep > 1 && (
+                <div className="bg-slate-800 p-4 rounded-xl border border-slate-700">
+                    <h3 className="text-sm font-bold text-slate-300 mb-2 border-b border-slate-700 pb-2">Algorithm Analysis: {selectedAlgo}</h3>
+                    <p className="text-sm text-slate-400">
+                        {selectedAlgo === 'Canny' && "Canny uses double thresholding and hysteresis, which connects weak edges to strong edges. This is why it usually produces the cleanest, continuous lines for lane detection."}
+                        {selectedAlgo === 'Sobel' && "Sobel computes the gradient approximation. It's very fast but can produce thick or noisy edges because it doesn't thin them out like Canny."}
+                        {selectedAlgo === 'Prewitt' && "Prewitt is similar to Sobel but uses a simpler kernel. It gave the highest accuracy (FOM) in the paper's specific tests, likely due to less noise sensitivity in their specific dataset."}
+                        {selectedAlgo === 'Laplacian' && "Laplacian calculates the second derivative (rate of change of gradient). It's very sensitive to noise, so you might see 'speckles' on the road surface."}
+                        {selectedAlgo === 'Roberts' && "Roberts uses a tiny 2x2 kernel. It's extremely fast and good for sharp diagonal edges but often misses softer lane markings."}
+                    </p>
+                </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default LaneDetectionApp;
